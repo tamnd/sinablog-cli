@@ -1,77 +1,81 @@
+// Copyright 2026 Duc-Tam Nguyen
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package sinablog
 
 import (
 	"context"
-	"net/url"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes sinablog as a kit Domain: a driver that a multi-domain
-// host (ant) enables with a single blank import,
-//
-//	import _ "github.com/tamnd/sinablog-cli/sinablog"
-//
-// exactly as a database/sql program enables a driver with `import _
-// "github.com/lib/pq"`. The init below registers it; the host then dereferences
-// sinablog:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone sinablog binary (see cli.NewApp), so the
-// binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the sinablog driver. It carries no state; the per-run client is
-// built by the factory Register hands kit.
+// Domain is the Sina Blog driver for the kit framework.
 type Domain struct{}
 
-// Info describes the scheme, the hostnames a pasted link is matched against, and
-// the identity reused for the binary's help and version.
+// Info describes the scheme and identity used by both the standalone binary
+// and multi-domain hosts.
 func (Domain) Info() kit.DomainInfo {
 	return kit.DomainInfo{
-		Scheme: "sinablog",
-		Hosts:  []string{Host},
+		Scheme:  "sinablog",
+		Aliases: []string{"sb"},
+		Hosts:   []string{Host, "search.sina.com.cn"},
 		Identity: kit.Identity{
 			Binary: "sinablog",
 			Short:  "Fetch public Sina Blog posts from the command line",
-			Long: `Fetch public Sina Blog posts from the command line
+			Long: `sinablog turns blog.sina.com.cn into a fast, scriptable command line.
 
-sinablog reads public sinablog data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
+Browse top-ranked blog posts and search across millions of Sina Blog entries.
+No account, cookie, or API key required.
+
+Quick start:
+  sinablog hot                     top 30 blog posts today
+  sinablog hot --period week       top 30 this week
+  sinablog hot --category 113      Internet & Tech blogs, daily
+  sinablog search "人工智能"         search for AI blogs
+  sinablog search "python" -o json results as JSON`,
 			Site: Host,
 			Repo: "https://github.com/tamnd/sinablog-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and operations onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `sinablog page` and
-	// `ant get sinablog://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "hot",
+		Group:   "posts",
+		Summary: "List top-ranked Sina Blog posts",
+	}, hotPosts)
 
-	// List op: members of a page, the home of `sinablog links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// sinablog://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	kit.Handle(app, kit.OpMeta{
+		Name:    "search",
+		Group:   "posts",
+		Summary: "Search Sina Blog content",
+		Args:    []kit.Arg{{Name: "query", Help: "search query (Chinese or English)"}},
+	}, searchPosts)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	c := DefaultConfig()
 	if cfg.UserAgent != "" {
 		c.UserAgent = cfg.UserAgent
 	}
@@ -82,45 +86,31 @@ func newClient(_ context.Context, cfg kit.Config) (any, error) {
 		c.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		c.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClient(c), nil
 }
 
-// --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
+type hotInput struct {
+	Period   string  `kit:"flag" help:"ranking period: day|week|month" default:"day"`
+	Category string  `kit:"flag" help:"category ID (999=all, 113=tech)" default:"999"`
+	Limit    int     `kit:"flag" help:"max results (1-100)" default:"30"`
+	Client   *Client `kit:"inject"`
+}
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  string  `kit:"arg"  help:"search query"`
+	Limit  int     `kit:"flag" help:"max results" default:"20"`
+	Page   int     `kit:"flag" help:"starting page number" default:"1"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
-}
-
-// --- handlers ---
-
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func hotPosts(ctx context.Context, in hotInput, emit func(HotPost) error) error {
+	posts, err := in.Client.Hot(ctx, in.Category, in.Period, in.Limit)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
+	for _, p := range posts {
 		if err := emit(p); err != nil {
 			return err
 		}
@@ -128,46 +118,71 @@ func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full sinablog.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized sinablog reference: %q", input)
+func searchPosts(ctx context.Context, in searchInput, emit func(SearchPost) error) error {
+	if strings.TrimSpace(in.Query) == "" {
+		return errs.Usage("query is required")
 	}
-	return "page", id, nil
+	posts, err := in.Client.Search(ctx, in.Query, in.Limit, in.Page)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, p := range posts {
+		if err := emit(p); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// Locate is the inverse: the live https URL for a (type, id).
+// Classify turns a Sina Blog URL or post ID into (type, id).
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty input")
+	}
+	// http://blog.sina.com.cn/s/blog_<id>.html
+	if strings.Contains(input, "blog.sina.com.cn/s/blog_") {
+		parts := strings.Split(input, "/s/blog_")
+		if len(parts) > 1 {
+			pid := strings.TrimSuffix(parts[1], ".html")
+			pid = strings.Split(pid, "?")[0]
+			if pid != "" {
+				return "post", pid, nil
+			}
+		}
+	}
+	// Sina user page: http://blog.sina.com.cn/u/<uid>
+	if strings.Contains(input, "blog.sina.com.cn/u/") {
+		parts := strings.Split(input, "/u/")
+		if len(parts) > 1 {
+			uid := strings.Split(parts[1], "?")[0]
+			uid = strings.TrimSuffix(uid, "/")
+			if uid != "" {
+				return "user", uid, nil
+			}
+		}
+	}
+	return "", "", errs.Usage("sinablog: unrecognized reference: %q", input)
+}
+
+// Locate returns the canonical URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	switch uriType {
+	case "post":
+		return fmt.Sprintf("http://blog.sina.com.cn/s/blog_%s.html", id), nil
+	case "user":
+		return fmt.Sprintf("http://blog.sina.com.cn/u/%s", id), nil
+	default:
 		return "", errs.Usage("sinablog has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
 }
 
-// --- helpers ---
-
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
-	}
-	return strings.Trim(input, "/")
-}
-
-// mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
 func mapErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrNotFound) {
+		return errs.NotFound("%s", err.Error())
+	}
 	return err
 }
